@@ -1,0 +1,131 @@
+name: Run MoneyPrinterTurbo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: moneyprinterturbo
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -n 1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --disable-pip-version-check --retries 5 --timeout 120 -r requirements.txt
+
+      - name: Restore latest saved state from a previous run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p storage
+
+          RUN_ID="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/${GITHUB_WORKFLOW_REF##*/}/runs?branch=${GITHUB_REF_NAME}&status=completed&per_page=20" \
+            --jq '.workflow_runs[] | select(.id != '${GITHUB_RUN_ID}') | .id' \
+            | head -n 1)"
+
+          if [ -z "${RUN_ID}" ]; then
+            echo "No previous completed MoneyPrinterTurbo run found. Starting fresh."
+            exit 0
+          fi
+
+          echo "Restoring artifact from previous run: ${RUN_ID}"
+          ARTIFACT_ID="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "moneyprinterturbo-state") | .id' \
+            | head -n 1)"
+
+          if [ -z "${ARTIFACT_ID}" ]; then
+            echo "Previous run has no moneyprinterturbo-state artifact. Starting fresh."
+            exit 0
+          fi
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > /tmp/moneyprinterturbo-state.zip
+
+          unzip -o /tmp/moneyprinterturbo-state.zip -d .
+          echo "Previous state restored."
+
+      - name: Prepare configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f config.toml ]; then
+            cp config.example.toml config.toml
+          fi
+
+      - name: Start MoneyPrinterTurbo API
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euo pipefail
+          nohup python main.py > moneyprinterturbo.log 2>&1 &
+          echo $! > moneyprinterturbo.pid
+
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8080/docs >/dev/null 2>&1; then
+              echo "MoneyPrinterTurbo API is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "MoneyPrinterTurbo API failed to start."
+          cat moneyprinterturbo.log
+          exit 1
+
+      - name: Keep service alive for this runner session
+        shell: bash
+        run: |
+          set -euo pipefail
+          END=$((SECONDS + 20700))
+          while [ "$SECONDS" -lt "$END" ]; do
+            if ! kill -0 "$(cat moneyprinterturbo.pid)" 2>/dev/null; then
+              echo "MoneyPrinterTurbo stopped unexpectedly."
+              cat moneyprinterturbo.log || true
+              exit 1
+            fi
+            sleep 30
+          done
+
+      - name: Save state and generated files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moneyprinterturbo-state
+          path: |
+            config.toml
+            storage/
+            resource/
+            moneyprinterturbo.log
+          if-no-files-found: ignore
+          retention-days: 3
+          compression-level: 6
+          overwrite: true
