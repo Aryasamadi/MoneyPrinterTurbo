@@ -17,44 +17,61 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      # ---------------------------------------------------------
+
+      # =========================================================
       # 1. Checkout
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------
+
+      # =========================================================
       # 2. Python
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
 
-      # ---------------------------------------------------------
+
+      # =========================================================
       # 3. System dependencies
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Install system dependencies
         run: |
+          set -e
+
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
 
-          ffmpeg -version
+          sudo apt-get install -y \
+            ffmpeg \
+            imagemagick \
+            openssh-client \
+            curl
+
+          echo "Python:"
           python --version
-          pip --version
 
-      # ---------------------------------------------------------
+          echo "FFmpeg:"
+          ffmpeg -version | head -n 1
+
+
+      # =========================================================
       # 4. Python dependencies
-      # ---------------------------------------------------------
+      # =========================================================
       - name: Install Python dependencies
         run: |
+          set -e
+
           python -m pip install --upgrade pip setuptools wheel
+
           python -m pip install -r requirements.txt
 
-      # ---------------------------------------------------------
-      # 5. Restore state from the latest previous run
-      # ---------------------------------------------------------
+
+      # =========================================================
+      # 5. Restore previous state
+      # =========================================================
       - name: Restore previous MoneyPrinterTurbo state
         env:
           GH_TOKEN: ${{ github.token }}
@@ -63,7 +80,7 @@ jobs:
 
           mkdir -p /tmp/mpt-restore
 
-          echo "Searching for previous completed MoneyPrinterTurbo runs..."
+          echo "Searching for previous completed MoneyPrinterTurbo run..."
 
           PREVIOUS_RUN_ID="$(
             gh run list \
@@ -90,9 +107,10 @@ jobs:
               "${PREVIOUS_RUN_ID}" \
               --repo "${GITHUB_REPOSITORY}" \
               --name moneyprinterturbo-state \
-              --dir /tmp/mpt-restore; then
+              --dir /tmp/mpt-restore
+          then
 
-            echo "Previous state downloaded successfully."
+            echo "Previous state downloaded."
 
             cp -a /tmp/mpt-restore/. .
 
@@ -105,54 +123,54 @@ jobs:
 
           fi
 
-      # ---------------------------------------------------------
-      # 6. Show restored structure
-      # ---------------------------------------------------------
-      - name: Inspect restored state
+
+      # =========================================================
+      # 6. Show restored files
+      # =========================================================
+      - name: Inspect state
         run: |
-          echo "Current project state:"
-          echo "----------------------"
+          echo "Checking restored state..."
+
+          if [ -f config.toml ]; then
+            echo "OK: config.toml"
+          fi
 
           if [ -d storage ]; then
-            echo "storage/ exists"
+            echo "OK: storage/"
           fi
 
           if [ -d output ]; then
-            echo "output/ exists"
+            echo "OK: output/"
           fi
 
           if [ -d temp ]; then
-            echo "temp/ exists"
+            echo "OK: temp/"
           fi
 
-          if [ -f config.toml ]; then
-            echo "config.toml exists"
-          else
-            echo "config.toml does not exist yet."
-          fi
 
-      # ---------------------------------------------------------
-      # 7. Start MoneyPrinterTurbo
-      # ---------------------------------------------------------
-      - name: Start MoneyPrinterTurbo
+      # =========================================================
+      # 7. Start MoneyPrinterTurbo API
+      # =========================================================
+      - name: Start MoneyPrinterTurbo API
         env:
           PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
 
-          echo "Starting MoneyPrinterTurbo..."
+          echo "Starting MoneyPrinterTurbo API..."
 
           python main.py \
-            > /tmp/moneyprinterturbo.log 2>&1 &
+            > /tmp/moneyprinterturbo-api.log 2>&1 &
 
-          echo $! > /tmp/moneyprinterturbo.pid
+          echo $! > /tmp/mpt-api.pid
 
-          echo "MoneyPrinterTurbo PID: $(cat /tmp/moneyprinterturbo.pid)"
+          echo "API PID: $(cat /tmp/mpt-api.pid)"
 
-      # ---------------------------------------------------------
+
+      # =========================================================
       # 8. Wait for API
-      # ---------------------------------------------------------
-      - name: Wait for MoneyPrinterTurbo
+      # =========================================================
+      - name: Wait for MoneyPrinterTurbo API
         run: |
           set -euo pipefail
 
@@ -164,26 +182,34 @@ jobs:
 
             if curl -fsS \
               http://127.0.0.1:8080/docs \
-              >/dev/null 2>&1; then
+              >/dev/null 2>&1
+            then
 
               echo "MoneyPrinterTurbo API is ready."
 
               READY=1
               break
+
             fi
+
 
             if ! kill -0 \
-              "$(cat /tmp/moneyprinterturbo.pid)" \
-              2>/dev/null; then
+              "$(cat /tmp/mpt-api.pid)" \
+              2>/dev/null
+            then
 
-              echo "MoneyPrinterTurbo stopped during startup."
+              echo "MoneyPrinterTurbo API stopped."
 
-              echo "---------------- LOG ----------------"
-              cat /tmp/moneyprinterturbo.log
-              echo "-------------------------------------"
+              echo "================ API LOG ================"
+
+              cat /tmp/moneyprinterturbo-api.log
+
+              echo "========================================="
 
               exit 1
+
             fi
+
 
             echo "Waiting... attempt ${i}/60"
 
@@ -191,46 +217,241 @@ jobs:
 
           done
 
+
           if [ "${READY}" -ne 1 ]; then
 
-            echo "MoneyPrinterTurbo did not become ready."
+            echo "MoneyPrinterTurbo API did not become ready."
 
-            echo "---------------- LOG ----------------"
-            cat /tmp/moneyprinterturbo.log
-            echo "-------------------------------------"
+            echo "================ API LOG ================"
+
+            cat /tmp/moneyprinterturbo-api.log
+
+            echo "========================================="
 
             exit 1
 
           fi
 
-      # ---------------------------------------------------------
-      # 9. Keep the runner alive
-      # ---------------------------------------------------------
+
+      # =========================================================
+      # 9. Start WebUI
+      # =========================================================
+      - name: Start MoneyPrinterTurbo WebUI
+        run: |
+          set -euo pipefail
+
+          echo "Starting MoneyPrinterTurbo WebUI..."
+
+          sh webui.sh \
+            > /tmp/moneyprinterturbo-webui.log 2>&1 &
+
+          echo $! > /tmp/mpt-webui.pid
+
+          echo "WebUI PID: $(cat /tmp/mpt-webui.pid)"
+
+
+      # =========================================================
+      # 10. Wait for WebUI
+      # =========================================================
+      - name: Wait for WebUI
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for WebUI..."
+
+          READY=0
+
+          for i in {1..90}; do
+
+            if curl -fsS \
+              http://127.0.0.1:8501/ \
+              >/dev/null 2>&1
+            then
+
+              echo "MoneyPrinterTurbo WebUI is ready."
+
+              READY=1
+              break
+
+            fi
+
+
+            if ! kill -0 \
+              "$(cat /tmp/mpt-webui.pid)" \
+              2>/dev/null
+            then
+
+              echo "WebUI stopped during startup."
+
+              echo "=============== WEBUI LOG ==============="
+
+              cat /tmp/moneyprinterturbo-webui.log
+
+              echo "=========================================="
+
+              exit 1
+
+            fi
+
+
+            echo "Waiting for WebUI... attempt ${i}/90"
+
+            sleep 2
+
+          done
+
+
+          if [ "${READY}" -ne 1 ]; then
+
+            echo "WebUI did not become ready."
+
+            echo "=============== WEBUI LOG ==============="
+
+            cat /tmp/moneyprinterturbo-webui.log
+
+            echo "=========================================="
+
+            exit 1
+
+          fi
+
+
+      # =========================================================
+      # 11. Temporary public tunnel
+      # =========================================================
+      - name: Start temporary WebUI tunnel
+        run: |
+          set -euo pipefail
+
+          echo "Starting temporary tunnel..."
+
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
+            -R 80:127.0.0.1:8501 \
+            nokey@localhost.run \
+            > /tmp/moneyprinterturbo-tunnel.log 2>&1 &
+
+          echo $! > /tmp/mpt-tunnel.pid
+
+          echo "Waiting for tunnel URL..."
+
+          URL=""
+
+          for i in {1..60}; do
+
+            URL="$(
+              grep -Eo \
+                'https://[^[:space:]]+' \
+                /tmp/moneyprinterturbo-tunnel.log \
+              | head -n 1 \
+              || true
+            )"
+
+
+            if [ -n "${URL}" ]; then
+
+              echo ""
+              echo "============================================================"
+              echo "MONEYPRINTERTURBO WEB UI"
+              echo ""
+              echo "${URL}"
+              echo ""
+              echo "============================================================"
+              echo ""
+
+              break
+
+            fi
+
+            sleep 2
+
+          done
+
+
+          if [ -z "${URL}" ]; then
+
+            echo "Tunnel URL was not detected."
+
+            echo "=============== TUNNEL LOG ==============="
+
+            cat /tmp/moneyprinterturbo-tunnel.log
+
+            echo "==========================================="
+
+            exit 1
+
+          fi
+
+
+      # =========================================================
+      # 12. Keep everything alive
+      # =========================================================
       - name: Keep MoneyPrinterTurbo running
         run: |
           set -euo pipefail
 
+          echo ""
+          echo "============================================================"
           echo "MoneyPrinterTurbo is running."
+          echo "The WebUI URL is shown in the previous step."
+          echo "============================================================"
+          echo ""
 
-          while kill -0 \
-            "$(cat /tmp/moneyprinterturbo.pid)" \
-            2>/dev/null; do
+          while true; do
+
+            if ! kill -0 \
+              "$(cat /tmp/mpt-api.pid)" \
+              2>/dev/null
+            then
+
+              echo "API stopped."
+
+              cat /tmp/moneyprinterturbo-api.log
+
+              exit 1
+
+            fi
+
+
+            if ! kill -0 \
+              "$(cat /tmp/mpt-webui.pid)" \
+              2>/dev/null
+            then
+
+              echo "WebUI stopped."
+
+              cat /tmp/moneyprinterturbo-webui.log
+
+              exit 1
+
+            fi
+
+
+            if ! kill -0 \
+              "$(cat /tmp/mpt-tunnel.pid)" \
+              2>/dev/null
+            then
+
+              echo "Tunnel stopped."
+
+              cat /tmp/moneyprinterturbo-tunnel.log
+
+              exit 1
+
+            fi
+
 
             sleep 30
 
           done
 
-          echo "MoneyPrinterTurbo stopped."
 
-          echo "---------------- LOG ----------------"
-          cat /tmp/moneyprinterturbo.log
-          echo "-------------------------------------"
-
-          exit 1
-
-      # ---------------------------------------------------------
-      # 10. Save state
-      # ---------------------------------------------------------
+      # =========================================================
+      # 13. Save state
+      # =========================================================
       - name: Save MoneyPrinterTurbo state
         if: always()
         uses: actions/upload-artifact@v4
@@ -243,16 +464,19 @@ jobs:
             temp/
           if-no-files-found: ignore
           retention-days: 3
-          overwrite: true
 
-      # ---------------------------------------------------------
-      # 11. Save log
-      # ---------------------------------------------------------
-      - name: Save MoneyPrinterTurbo log
+
+      # =========================================================
+      # 14. Save logs
+      # =========================================================
+      - name: Save MoneyPrinterTurbo logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: moneyprinterturbo-log-${{ github.run_id }}
-          path: /tmp/moneyprinterturbo.log
+          name: moneyprinterturbo-logs-${{ github.run_id }}
+          path: |
+            /tmp/moneyprinterturbo-api.log
+            /tmp/moneyprinterturbo-webui.log
+            /tmp/moneyprinterturbo-tunnel.log
           if-no-files-found: ignore
           retention-days: 3
