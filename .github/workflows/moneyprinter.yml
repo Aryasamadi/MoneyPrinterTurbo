@@ -250,10 +250,13 @@ jobs:
           URL=""
 
           for i in {1..60}; do
+
             URL="$(
               grep -Eo \
                 'https://[^[:space:]]+' \
                 /tmp/moneyprinterturbo-tunnel.log \
+              | grep -E \
+                '\.pinggy\.net|\.pinggy-free\.link' \
               | head -n 1 \
               || true
             )"
