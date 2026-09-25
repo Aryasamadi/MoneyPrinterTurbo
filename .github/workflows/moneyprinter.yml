@@ -17,105 +17,221 @@ jobs:
     timeout-minutes: 350
 
     steps:
+      # ---------------------------------------------------------
+      # 1. Checkout
+      # ---------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ---------------------------------------------------------
+      # 2. Python
+      # ---------------------------------------------------------
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
           cache: pip
 
-      - name: Install FFmpeg
+      # ---------------------------------------------------------
+      # 3. System dependencies
+      # ---------------------------------------------------------
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
-          ffmpeg -version | head -n 1
+          sudo apt-get install -y ffmpeg
 
+          ffmpeg -version
+          python --version
+          pip --version
+
+      # ---------------------------------------------------------
+      # 4. Python dependencies
+      # ---------------------------------------------------------
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install --disable-pip-version-check --retries 5 --timeout 120 -r requirements.txt
+          python -m pip install -r requirements.txt
 
-      - name: Restore latest saved state from a previous run
+      # ---------------------------------------------------------
+      # 5. Restore state from the latest previous run
+      # ---------------------------------------------------------
+      - name: Restore previous MoneyPrinterTurbo state
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p storage
 
-          RUN_ID="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/${GITHUB_WORKFLOW_REF##*/}/runs?branch=${GITHUB_REF_NAME}&status=completed&per_page=20" \
-            --jq '.workflow_runs[] | select(.id != '${GITHUB_RUN_ID}') | .id' \
-            | head -n 1)"
+          mkdir -p /tmp/mpt-restore
 
-          if [ -z "${RUN_ID}" ]; then
-            echo "No previous completed MoneyPrinterTurbo run found. Starting fresh."
+          echo "Searching for previous completed MoneyPrinterTurbo runs..."
+
+          PREVIOUS_RUN_ID="$(
+            gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow "moneyprinter.yml" \
+              --branch "${GITHUB_REF_NAME}" \
+              --status completed \
+              --limit 20 \
+              --json databaseId \
+              --jq '.[].databaseId' \
+            | grep -v "^${GITHUB_RUN_ID}$" \
+            | head -n 1 || true
+          )"
+
+          if [ -z "${PREVIOUS_RUN_ID}" ]; then
+            echo "No previous completed run found."
+            echo "Starting with a clean state."
             exit 0
           fi
 
-          echo "Restoring artifact from previous run: ${RUN_ID}"
-          ARTIFACT_ID="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name == "moneyprinterturbo-state") | .id' \
-            | head -n 1)"
+          echo "Previous run found: ${PREVIOUS_RUN_ID}"
 
-          if [ -z "${ARTIFACT_ID}" ]; then
-            echo "Previous run has no moneyprinterturbo-state artifact. Starting fresh."
-            exit 0
+          if gh run download \
+              "${PREVIOUS_RUN_ID}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --name moneyprinterturbo-state \
+              --dir /tmp/mpt-restore; then
+
+            echo "Previous state downloaded successfully."
+
+            cp -a /tmp/mpt-restore/. .
+
+            echo "Previous state restored."
+
+          else
+
+            echo "Previous state artifact was not available."
+            echo "Starting with a clean state."
+
           fi
 
-          gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
-            > /tmp/moneyprinterturbo-state.zip
-
-          unzip -o /tmp/moneyprinterturbo-state.zip -d .
-          echo "Previous state restored."
-
-      - name: Prepare configuration
-        shell: bash
+      # ---------------------------------------------------------
+      # 6. Show restored structure
+      # ---------------------------------------------------------
+      - name: Inspect restored state
         run: |
-          set -euo pipefail
-          if [ ! -f config.toml ]; then
-            cp config.example.toml config.toml
+          echo "Current project state:"
+          echo "----------------------"
+
+          if [ -d storage ]; then
+            echo "storage/ exists"
           fi
 
-      - name: Start MoneyPrinterTurbo API
+          if [ -d output ]; then
+            echo "output/ exists"
+          fi
+
+          if [ -d temp ]; then
+            echo "temp/ exists"
+          fi
+
+          if [ -f config.toml ]; then
+            echo "config.toml exists"
+          else
+            echo "config.toml does not exist yet."
+          fi
+
+      # ---------------------------------------------------------
+      # 7. Start MoneyPrinterTurbo
+      # ---------------------------------------------------------
+      - name: Start MoneyPrinterTurbo
         env:
-          PYTHONUNBUFFERED: '1'
+          PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
-          nohup python main.py > moneyprinterturbo.log 2>&1 &
-          echo $! > moneyprinterturbo.pid
 
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:8080/docs >/dev/null 2>&1; then
+          echo "Starting MoneyPrinterTurbo..."
+
+          python main.py \
+            > /tmp/moneyprinterturbo.log 2>&1 &
+
+          echo $! > /tmp/moneyprinterturbo.pid
+
+          echo "MoneyPrinterTurbo PID: $(cat /tmp/moneyprinterturbo.pid)"
+
+      # ---------------------------------------------------------
+      # 8. Wait for API
+      # ---------------------------------------------------------
+      - name: Wait for MoneyPrinterTurbo
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for MoneyPrinterTurbo API..."
+
+          READY=0
+
+          for i in {1..60}; do
+
+            if curl -fsS \
+              http://127.0.0.1:8080/docs \
+              >/dev/null 2>&1; then
+
               echo "MoneyPrinterTurbo API is ready."
-              exit 0
+
+              READY=1
+              break
             fi
-            sleep 2
-          done
 
-          echo "MoneyPrinterTurbo API failed to start."
-          cat moneyprinterturbo.log
-          exit 1
+            if ! kill -0 \
+              "$(cat /tmp/moneyprinterturbo.pid)" \
+              2>/dev/null; then
 
-      - name: Keep service alive for this runner session
-        shell: bash
-        run: |
-          set -euo pipefail
-          END=$((SECONDS + 20700))
-          while [ "$SECONDS" -lt "$END" ]; do
-            if ! kill -0 "$(cat moneyprinterturbo.pid)" 2>/dev/null; then
-              echo "MoneyPrinterTurbo stopped unexpectedly."
-              cat moneyprinterturbo.log || true
+              echo "MoneyPrinterTurbo stopped during startup."
+
+              echo "---------------- LOG ----------------"
+              cat /tmp/moneyprinterturbo.log
+              echo "-------------------------------------"
+
               exit 1
             fi
-            sleep 30
+
+            echo "Waiting... attempt ${i}/60"
+
+            sleep 2
+
           done
 
-      - name: Save state and generated files
+          if [ "${READY}" -ne 1 ]; then
+
+            echo "MoneyPrinterTurbo did not become ready."
+
+            echo "---------------- LOG ----------------"
+            cat /tmp/moneyprinterturbo.log
+            echo "-------------------------------------"
+
+            exit 1
+
+          fi
+
+      # ---------------------------------------------------------
+      # 9. Keep the runner alive
+      # ---------------------------------------------------------
+      - name: Keep MoneyPrinterTurbo running
+        run: |
+          set -euo pipefail
+
+          echo "MoneyPrinterTurbo is running."
+
+          while kill -0 \
+            "$(cat /tmp/moneyprinterturbo.pid)" \
+            2>/dev/null; do
+
+            sleep 30
+
+          done
+
+          echo "MoneyPrinterTurbo stopped."
+
+          echo "---------------- LOG ----------------"
+          cat /tmp/moneyprinterturbo.log
+          echo "-------------------------------------"
+
+          exit 1
+
+      # ---------------------------------------------------------
+      # 10. Save state
+      # ---------------------------------------------------------
+      - name: Save MoneyPrinterTurbo state
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -123,9 +239,20 @@ jobs:
           path: |
             config.toml
             storage/
-            resource/
-            moneyprinterturbo.log
+            output/
+            temp/
           if-no-files-found: ignore
           retention-days: 3
-          compression-level: 6
           overwrite: true
+
+      # ---------------------------------------------------------
+      # 11. Save log
+      # ---------------------------------------------------------
+      - name: Save MoneyPrinterTurbo log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moneyprinterturbo-log-${{ github.run_id }}
+          path: /tmp/moneyprinterturbo.log
+          if-no-files-found: ignore
+          retention-days: 3
