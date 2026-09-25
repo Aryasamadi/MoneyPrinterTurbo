@@ -252,7 +252,7 @@ jobs:
           for i in {1..60}; do
             URL="$(
               grep -Eo \
-                'https://[^[:space:]]+\.pinggy\.link' \
+                'https://[^[:space:]]+' \
                 /tmp/moneyprinterturbo-tunnel.log \
               | head -n 1 \
               || true
